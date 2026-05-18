@@ -17,25 +17,22 @@
 
 static constexpr size_t MAX_MSG_LEN = 2048;
 
-// raw terminal raii
 struct RawTerm {
     struct termios saved{};
     explicit RawTerm() {
         tcgetattr(STDIN_FILENO, &saved);
         struct termios raw = saved;
-        raw.c_lflag &= ~(ICANON | ECHO);   // no line buffering, no echo
-        raw.c_cc[VMIN]  = 0;               // non-blocking reads
-        raw.c_cc[VTIME] = 1;               // 100 ms timeout → lets us poll flags
+        raw.c_lflag &= ~(ICANON | ECHO);
+        raw.c_cc[VMIN]  = 0;
+        raw.c_cc[VTIME] = 1;
         tcsetattr(STDIN_FILENO, TCSANOW, &raw);
     }
     ~RawTerm() { tcsetattr(STDIN_FILENO, TCSANOW, &saved); }
 };
 
-// sigwhich
 static std::atomic<bool> g_resized{false};
 static void on_sigwinch(int) { g_resized = true; }
 
-// handshake
 static bool do_handshake(int fd, const std::string& nick, const std::string& raw_key) {
     std::string hex;
     hex.reserve(raw_key.size() * 2);
@@ -50,7 +47,6 @@ static bool do_handshake(int fd, const std::string& nick, const std::string& raw
     return resp == "OK";
 }
 
-// session
 static bool run_session(const std::string& host, int port,
                         const std::string& nick,
                         const std::string& passphrase,
@@ -72,7 +68,6 @@ static bool run_session(const std::string& host, int port,
     std::atomic<bool> alive{true};
     std::atomic<bool> user_quit{false};
 
-    // recv threads
     std::thread recv_t([&, fd]() {
         while (alive) {
             std::string frame;
@@ -91,8 +86,6 @@ static bool run_session(const std::string& host, int port,
 
             if (msg.type == MsgType::CHAT) {
                 std::lock_guard<std::mutex> lk(cout_mutex);
-                // _emit() saves cursor → prints in scroll region → restores cursor.
-                // the sticky input line is never touched.
                 term::msg(msg.nick, msg.payload);
             } else if (msg.type == MsgType::PING) {
                 Message pong; pong.type = MsgType::PONG; pong.nick = nick;
@@ -105,16 +98,13 @@ static bool run_session(const std::string& host, int port,
         shutdown(fd, SHUT_RDWR);
     });
 
-    // enter raw + sticky inputs
     term::sys("press Enter to start chatting...");
 
-    RawTerm raw_term;                   // disables ICANON + ECHO
-    signal(SIGWINCH, on_sigwinch);      // handle terminal resize
+    RawTerm raw_term;
+    signal(SIGWINCH, on_sigwinch);
 
-    // Drain any leftover newline from previous getline-style input.
     { char ch; while (read(STDIN_FILENO, &ch, 1) > 0 && ch != '\n' && ch != '\r') {} }
 
-    // scroll region
     {
         std::lock_guard<std::mutex> lk(cout_mutex);
         term::screen::init();
@@ -123,10 +113,7 @@ static bool run_session(const std::string& host, int port,
         term::_redraw_input();
     }
 
-
-    // input loop
     while (alive) {
-        // handle terminal resize between keystrokes
         if (g_resized.exchange(false)) {
             std::lock_guard<std::mutex> lk(cout_mutex);
             term::screen::resize();
@@ -136,17 +123,14 @@ static bool run_session(const std::string& host, int port,
         char ch;
         ssize_t n = read(STDIN_FILENO, &ch, 1);
         if (n < 0) break;
-        if (n == 0) continue;   // 100 ms timeout — just loop
+        if (n == 0) continue;
 
         if (ch == '\n' || ch == '\r') {
-            // submit fix
             std::string text;
             {
                 std::lock_guard<std::mutex> lk(cout_mutex);
                 text = term::input::buf();
                 term::input::buf().clear();
-                // Clear and redraw the input row as an empty prompt immediately
-                // so the user sees the line "reset" before any network delay.
                 term::_redraw_input();
             }
 
@@ -184,36 +168,34 @@ static bool run_session(const std::string& host, int port,
                     term::err("send failed — connection lost");
                     alive = false; break;
                 }
+                std::lock_guard<std::mutex> lk(cout_mutex);
+                term::msg(nick, text);
             } catch (const std::exception& e) {
                 std::lock_guard<std::mutex> lk(cout_mutex);
                 term::err(e.what());
             }
 
         } else if (ch == 127 || ch == '\b') {
-            // backspace fix
             std::lock_guard<std::mutex> lk(cout_mutex);
             if (!term::input::buf().empty()) {
                 term::input::buf().pop_back();
-                term::_redraw_input();   // redraws whole line — handles multibyte
+                term::_redraw_input();
             }
-            // buf empty → silent no-op; prompt cannot be erased
 
         } else if (static_cast<unsigned char>(ch) >= 32) {
-            // printable characters
             std::lock_guard<std::mutex> lk(cout_mutex);
             if (term::input::buf().size() < MAX_MSG_LEN) {
                 term::input::buf() += ch;
-                std::cout << ch << std::flush;   // echo in-place; cursor advances
+                std::cout << ch << std::flush;
             }
         }
     }
 
-    // teardown
     {
         std::lock_guard<std::mutex> lk(cout_mutex);
         term::input::nick().clear();
         term::input::buf().clear();
-        term::screen::cleanup();            // restore full scroll region
+        term::screen::cleanup();
     }
     signal(SIGWINCH, SIG_DFL);
 
